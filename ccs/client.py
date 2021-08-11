@@ -3,6 +3,7 @@
 import requests
 import os
 from pathlib import Path
+from pprint import pformat
 
 from .error import CloudSigmaClientError,ParameterError,ResourceNotFound
 
@@ -42,6 +43,9 @@ class CloudSigmaClient(object):
         self.subscription = cloudsigma.resource.Subscriptions()
         self.capabilities = cloudsigma.resource.Capabilites()
 
+        self.list_format=None
+
+
     def _get_name(self, uuid, _type):
         if _type == 'server':
             server = self.find_server(uuid)
@@ -61,54 +65,126 @@ class CloudSigmaClient(object):
             raise ParameterError('unknown resource type {_type}')
         return name or f'<unnamed_{_type}>'
 
-    def _format_resource(self, resource, item):
-        data = dict(uuid=item['uuid'])
+    def _format_resource(self, resource, item, list_format):
         if resource == self.server:
-            label = 'server' 
-            name = self._get_name(item['uuid'], 'server')
-            drives = [self._get_name(drive['drive']['uuid'], 'drive') for drive in item['drives']]
+            label = 'server'
             count = item['smp']
             speed = int(item['cpu'])/ count
-            detail = f"status={item['status']} cpu={count}x{speed/1000}Ghz memory={self.format_memory_value(item['mem'])} drives={drives}"
+            nics = []
+            for nic in item['nics']:
+                mac = nic['mac']
+                if nic['vlan']:
+                    config = 'vlan'
+                else:
+                    config = nic['ip_v4_conf']['conf']
+                if config=='static':
+                    if nic['runtime']:
+                        ip = nic['runtime']['ip_v4']['uuid']
+                    else:
+                        ip = nic['ip_v4_conf']['ip']['uuid']
+                elif config=='dhcp':
+                    if nic['runtime']:
+                        ip = nic['runtime']['ip_v4']['uuid']
+                    else:
+                        ip='<assigned-on-boot>'
+                elif config in ['manual', 'vlan']:
+                    ip='<os-configured>'
+                else:
+                    raise ParameterError(f'unknown nic conf value {config}')
+                nics.append({mac: dict(config=config, ip=ip)})
+            if item['cpus_instead_of_cores']:
+                smp_type = 'cpu' 
+            else:
+                smp_type = 'core'
+            data = [
+                dict(name=self._get_name(item['uuid'], label)),
+                dict(status=item['status']),
+                dict(cpu=f'{count}'),
+                dict(clock=f'{speed/1000}Ghz'),
+                dict(smp=smp_type),
+                dict(memory=self.format_memory_value(item['mem'])),
+                dict(drives=[self._get_name(drive['drive']['uuid'], 'drive') for drive in item['drives']]),
+                dict(nics=nics)
+            ]
         elif resource == self.drive:
-            label = 'drive' 
-            name = self._get_name(item['uuid'], 'drive')
+            label = 'drive'
             mounted = item['mounted_on']
             if len(mounted):
-                mounted = f"mounted={[self._get_name(server['uuid'], 'server') for server in mounted]}"
+                mounted_on = [self._get_name(server['uuid'], 'server') for server in mounted]
             else:
-                mounted = '<unmounted>'
-            detail = f"size={self.format_memory_value(item['size'])} media={item['media']} type={item['storage_type']} {mounted}"
+                mounted_on = []
+            data = [
+                dict(name=self._get_name(item['uuid'], label)),
+                dict(size=self.format_memory_value(item['size'])),
+                dict(media=item['media']),
+                dict(storage_type=item['storage_type']),
+                dict(mounted=mounted_on)
+            ]
         elif resource == self.vlan:
             label = 'vlan'
-            name = self._get_name(item['uuid'], 'vlan')
-            detail = f"'{item['meta'].get('description')}'"
+            data = [
+                dict(name=self._get_name(item['uuid'], label)),
+                dict(description=item['meta'].get('description'))
+            ]
         elif resource == self.ip:
             label = 'ip'
-            name = self._get_name(item['uuid'], 'ip')
-            detail = f"[{self._get_name(item['server']['uuid'], 'server') if item['server'] else 'free'}] '{item['meta'].get('description')}'"
+            data = [
+                dict(name=self._get_name(item['uuid'], label)),
+                dict(server=[self._get_name(item['server']['uuid'], 'server') if item['server'] else 'unassigned']),
+                dict(description=item['meta'].get('description'))
+            ]
         elif resource == self.subscription:
             label = 'subscription'
-            name = self._get_name(item['uuid'], 'subscription')
-            detail = ''
+            data = [
+                dict(name=self._get_name(item['uuid'], label)),
+                dict(detail='')
+            ]
         else:
-            label = 'unknown'
-            detail = ''
+            raise ParameterError(f'Unknown resource: {resource}')
 
-        return f"{label} {item['uuid']} '{name}' {detail}"
+        if list_format == 'text':
+            dlines=['']
+            for dd in data:
+                assert(len(dd))==1
+                for k,v in dd.items():
+                    if isinstance(v, list):
+                        if k == 'nics':
+                            dlines.append(f'{k}=[')
+                            for vv in v:
+                                dlines.append(f'  {vv}')
+                            dlines.append(f']')
+                        elif k == 'drives':
+                            dlines.append(f'{k}={v}')
+                    else:
+                        if len(dlines[-1]):
+                            dlines[-1] += '  '
+                        dlines[-1] += f"{k}={v}"
+            longest = max([len(dd) for dd in dlines])
+            dlines = [d + (' ' * (longest-len(d))) for d in dlines][:longest]
 
-    def _list_resources(self, resource, detail=False, uuid=False, human=False):
-        if detail or uuid or human:
+            data = dlines
+
+        return {item['uuid']: data}
+
+    def _list_resources(self, resource, list_format):
+        if list_format:
             resources = resource.list_detail()
         else:
             resources = resource.list()
-        if uuid:
+
+        if list_format == 'uuid':
             resources = [i['uuid'] for i in resources]
-        elif human:
-            resources = [self._format_resource(resource, item) for item in resources]
+        elif list_format in ['human', 'text']:
+            resources = [self._format_resource(resource, item, list_format) for item in resources]
+        elif list_format in ['detail', None]:
+            # no post-processing
+            pass
+        else:
+            raise ParameterError(f"unknown list_format {self.list_format}")
+
         return resources
 
-    def list_all(self, detail=False, uuid=False, human=False):
+    def list_all(self, list_format):
         resources = {}
         all_resources = dict(
             servers=self.server,
@@ -117,47 +193,47 @@ class CloudSigmaClient(object):
             ips=self.ip
         )
         for label, resource in all_resources.items():
-            resources[label] = self._list_resources(resource, detail, uuid, human)
+            resources[label] = self._list_resources(resource, list_format)
         return resources
 
-    def list_servers(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.server, detail, uuid, human)
+    def list_servers(self, list_format):
+        return self._list_resources(self.server, list_format)
 
-    def list_drives(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.drive, detail, uuid, human)
+    def list_drives(self, list_format):
+        return self._list_resources(self.drive, list_format)
 
-    def list_vlans(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.vlan, detail, uuid, human)
+    def list_vlans(self, list_format):
+        return self._list_resources(self.vlan, list_format)
 
-    def list_ips(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.ip, detail, uuid, human)
+    def list_ips(self, list_format):
+        return self._list_resources(self.ip, list_format)
 
-    def list_subscriptions(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.subscription)
+    def list_subscriptions(self, list_format):
+        return self._list_resources(self.subscription, list_format)
 
-    def list_capabilities(self, detail=False, uuid=False, human=False):
-        return self._list_resources(self.capabilities)
+    def list_capabilities(self, list_format):
+        return self._list_resources(self.capabilities, list_format)
 
-    def _find_resource(self, resources, _type, name):
-        for resource in resources:
+    def _find_resource(self, resource_lister, _type, name):
+        for resource in resource_lister('detail'):
             if name in [resource.get('name'), resource.get('uuid')]:
                 return resource
         raise ResourceNotFound(f'unknown {_type} {name}')
 
     def find_server(self, name):
-        return self._find_resource(self.list_servers(True), 'server', name)
+        return self._find_resource(self.list_servers, 'server', name)
 
     def find_drive(self, name):
-        return self._find_resource(self.list_drives(True), 'drive', name)
+        return self._find_resource(self.list_drives, 'drive', name)
 
     def find_vlan(self, name):
-        return self._find_resource(self.list_vlans(True), 'vlan', name)
+        return self._find_resource(self.list_vlans, 'vlan', name)
 
     def find_ip(self, name=None):
-        return self._find_resource(self.list_ips(True), 'ip', name)
+        return self._find_resource(self.list_ips, 'ip', name)
 
     def find_subscription(self, name=None):
-        return self._find_resource(self.list_subscriptions(True), 'subscription', name)
+        return self._find_resource(self.list_subscriptions, 'subscription', name)
 
     def open_tty(self, name):
         return self.server.open_console(self.find_server(name)['uuid'])
